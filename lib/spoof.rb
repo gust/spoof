@@ -18,6 +18,16 @@ module Spoof
   module EmailValidation
     EmailValidationError = Class.new(StandardError)
 
+    module Results
+      class Success
+        include Concord::Public.new(:address, :results)
+      end
+
+      class Failure
+        include Concord::Public.new(:address, :error)
+      end
+    end
+
     Validations = {
       local: ->(address) {
         address.local.present? ?
@@ -39,34 +49,113 @@ module Spoof
 
     module_function
 
-    class AccumulateSuccess
-      def initialize(either, successes = [])
-        @either = either
-        @successes = successes
-      end
-
-      def >>(f, &blk)
-        either.
-          public_send(:>>, f, &blk).
-          either(
-            ->(_) { self },
-            ->(success) { AccumulateSuccess.new(either, successes + [success]) }
-          )
-      end
-
-      attr_reader :successes
-      attr_reader :either
+    def validate(address_string)
+      Unsound::Control.try {
+        Mail::Address.new(address_string)
+      }.and_then { |address|
+        Unsound::Control.try {
+          Validations.reduce({ }) do |result, (validator_name, validator)|
+            validator[address].either(
+              ->(exception) { raise exception },
+              ->(success) { result.merge(validator_name => success) }
+            )
+          end
+        }.either(
+          ->(error) { Results::Failure.new(address, error) },
+          ->(results) { Results::Success.new(address, results) }
+        )
+      }.or_else { |error|
+        Results::Failure.new(nil, error)
+      }
     end
 
-    def validate(address)
-      Validations.reduce(AccumulateSuccess.new(Unsound::Data::Either.of(address))) do |result, (_, validator)|
-        result >> validator
+  end
+end
+
+class Serializer
+  def initialize
+    @registry = { }
+  end
+
+  def register(serializes, serializer)
+    registry.merge!(serializes => serializer)
+  end
+
+  def serialize(object)
+    case object
+    when Hash
+      object.reduce({ }) do |serialized, (key, value)|
+        serialized.merge(key => serialize(value))
+      end
+    when Array
+      object.map { |i| serialize(i) }
+    else
+      if serializer = find_serializer(object)
+        serialize(serializer.call(object))
+      else
+        object
       end
     end
+  end
+
+  private
+
+  attr_reader :registry
+
+  def find_serializer(object)
+    return unless key = registry.keys.find { |serializes| serializes[object] }
+    registry[key]
   end
 end
 
 module Spoof
+  JsonSerializer = Serializer.new.tap do |serializer|
+    serializer.register(
+      ->(object) { object.is_a?(EmailValidation::Results::Success) },
+      ->(object) do
+        {
+          success: {
+            address: object.address,
+            results: object.results
+          }
+        }
+      end
+    )
+    serializer.register(
+      ->(object) { object.is_a?(EmailValidation::Results::Failure) },
+      ->(object) do
+        {
+          failure: {
+            address: object.address,
+            error: object.error
+          }
+        }
+      end
+    )
+    serializer.register(
+      ->(object) { object.is_a?(Mail::Address) },
+      ->(object) do
+        {
+          format: object.format,
+          address: object.address,
+          local: object.local,
+          domain: object.domain,
+          display_name: object.display_name
+        }
+      end
+    )
+    serializer.register(
+      ->(object) { object.is_a?(Resolv::DNS::Resource::IN::MX) },
+      ->(object) do
+        {
+          exchange: object.exchange,
+          preference: object.preference,
+          ttl: object.ttl
+        }
+      end
+    )
+  end
+
   class HttpAPI < Grape::API
     version 'v1', using: :header, vendor: 'gust'
     format :json
@@ -77,9 +166,7 @@ module Spoof
         requires :address, type: String, desc: "The email address to validate"
       end
       post do
-        EmailValidation.validate(Mail::Address.new(params[:address])).tap do |result|
-          binding.pry
-        end
+        { data: JsonSerializer.serialize(EmailValidation.validate(params[:address])) }
       end
     end
   end
